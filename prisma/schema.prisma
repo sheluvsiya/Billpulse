@@ -1,0 +1,199 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountType { INDIVIDUAL BUSINESS }
+enum InvoiceStatus { DRAFT SENT APPROVED REJECTED PAID OVERDUE CANCELED }
+enum SubscriptionStatus { TRIALING ACTIVE PAST_DUE CANCELED EXPIRED }
+enum BillingInterval { MONTHLY QUARTERLY ANNUAL }
+enum PaymentProvider { STRIPE PAYFAST PAYPAL BANK_TRANSFER }
+enum PaymentStatus { PENDING SUCCEEDED FAILED REFUNDED }
+enum InvoiceEventType { CREATED UPDATED SENT APPROVED REJECTED PAYMENT_RECEIVED RECEIPT_SENT REMINDER_SENT STATUS_CHANGED }
+enum NotificationType { TRIAL_ENDING INVOICE_SENT INVOICE_REMINDER INVOICE_APPROVED INVOICE_REJECTED PAYMENT_RECEIPT }
+
+model User {
+  id              String             @id @default(cuid())
+  email           String             @unique
+  emailVerifiedAt DateTime?
+  passwordHash    String
+  accountType     AccountType
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  individual      IndividualProfile?
+  business        BusinessProfile?
+  clients         Client[]
+  invoices        Invoice[]
+  subscriptions   Subscription[]
+  otpChallenges   OtpChallenge[]
+  @@index([createdAt])
+}
+
+model IndividualProfile {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  firstName      String
+  surname        String
+  countryCode    String
+  // Store a keyed HMAC of normalized government identifiers, never the cleartext ID.
+  idNumberHash   String
+  phone          String?
+  addressJson    Json?
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([countryCode, idNumberHash])
+}
+
+model BusinessProfile {
+  id                     String   @id @default(cuid())
+  userId                 String   @unique
+  companyName            String
+  normalizedCompanyName  String   @unique
+  countryCode            String
+  registrationNumberHash String?
+  logoObjectKey          String?
+  email                  String?
+  phone                  String?
+  addressJson            Json?
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([countryCode, registrationNumberHash])
+}
+
+// A single-use record keyed by an HMAC of normalized person/business identifiers
+// prevents repeat trials even if a user later deletes their account.
+model TrialIdentity {
+  id          String   @id @default(cuid())
+  fingerprint String   @unique
+  claimedAt   DateTime @default(now())
+}
+
+model Client {
+  id           String    @id @default(cuid())
+  ownerId      String
+  displayName  String
+  email        String?
+  phone        String?
+  addressJson  Json?
+  createdAt    DateTime  @default(now())
+  owner        User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  invoices     Invoice[]
+  @@index([ownerId, displayName])
+}
+
+model Invoice {
+  id              String          @id @default(cuid())
+  issuerId        String
+  clientId        String
+  number          String
+  status          InvoiceStatus   @default(DRAFT)
+  currency        String          @default("USD")
+  issueDate       DateTime        @default(now())
+  dueDate         DateTime
+  subtotalMinor   BigInt
+  taxMinor        BigInt          @default(0)
+  totalMinor      BigInt
+  templateKey     String          @default("clean-modern")
+  notes           String?
+  rejectionReason String?
+  sentAt          DateTime?
+  paidAt          DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  issuer          User            @relation(fields: [issuerId], references: [id], onDelete: Restrict)
+  client          Client          @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  lines           InvoiceLine[]
+  events          InvoiceEvent[]
+  payments        Payment[]
+  notificationLogs NotificationLog[]
+  @@unique([issuerId, number])
+  @@index([issuerId, status, dueDate])
+  @@index([clientId, createdAt])
+}
+
+model InvoiceLine {
+  id             String  @id @default(cuid())
+  invoiceId      String
+  description    String
+  quantity       Decimal @db.Decimal(12, 3)
+  unitAmountMinor BigInt
+  amountMinor    BigInt
+  invoice        Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  @@index([invoiceId])
+}
+
+// Append-only by application policy: never update/delete events; add a new event instead.
+model InvoiceEvent {
+  id         String           @id @default(cuid())
+  invoiceId  String
+  type       InvoiceEventType
+  actorId    String?
+  data       Json?
+  createdAt  DateTime         @default(now())
+  invoice    Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  @@index([invoiceId, createdAt])
+}
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  userId                 String
+  status                 SubscriptionStatus @default(TRIALING)
+  interval               BillingInterval?
+  provider               PaymentProvider?
+  providerSubscriptionId String?            @unique
+  trialEndsAt            DateTime?
+  currentPeriodStartsAt  DateTime?
+  currentPeriodEndsAt    DateTime?
+  cancelAtPeriodEnd      Boolean            @default(false)
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+  user                   User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  payments               Payment[]
+  @@index([userId, status])
+  @@index([status, trialEndsAt])
+}
+
+model Payment {
+  id                 String          @id @default(cuid())
+  invoiceId          String?
+  subscriptionId     String?
+  provider           PaymentProvider
+  providerPaymentId  String?         @unique
+  status             PaymentStatus   @default(PENDING)
+  amountMinor        BigInt
+  currency           String
+  receiptObjectKey   String?
+  createdAt          DateTime        @default(now())
+  invoice            Invoice?        @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  subscription       Subscription?   @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  @@index([invoiceId, status])
+}
+
+// Keep only a hash of the OTP; enforce expiry, one-time consumption, and attempt limits in service code.
+model OtpChallenge {
+  id           String   @id @default(cuid())
+  userId       String
+  codeHash     String
+  expiresAt    DateTime
+  consumedAt   DateTime?
+  attempts     Int      @default(0)
+  lastSentAt   DateTime @default(now())
+  createdAt    DateTime @default(now())
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, expiresAt])
+}
+
+model NotificationLog {
+  id             String           @id @default(cuid())
+  invoiceId      String
+  type           NotificationType
+  scheduledFor   DateTime
+  sentAt         DateTime?
+  idempotencyKey String           @unique
+  providerId     String?
+  createdAt      DateTime         @default(now())
+  invoice        Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  @@index([scheduledFor, sentAt])
+}
